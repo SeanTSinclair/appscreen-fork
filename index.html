@@ -793,7 +793,7 @@
                 <div id="headline-options">
                 <div class="control-group">
                     <div class="textarea-with-button">
-                        <textarea id="headline-text" rows="2" placeholder="Your feature headline"></textarea>
+                        <div id="headline-text" contenteditable="true" data-placeholder="Your feature headline" class="headline-editable"></div>
                         <button class="magic-translate-btn" id="translate-headline-btn" title="Translate to all languages">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M5 8l6 6M4 14l6-6 2-3M2 5h12M7 2v3M22 22l-5-10-5 10M14 18h6"/>
@@ -1943,6 +1943,19 @@
             </div>
             <p class="export-progress-detail" id="export-progress-detail"></p>
         </div>
+    </div>
+
+    <!-- Headline color toolbar -->
+    <div id="headline-color-toolbar" class="headline-color-toolbar" style="display:none;">
+        <div id="hct-swatches" class="hct-swatches"></div>
+        <div class="hct-divider"></div>
+        <label class="hct-add" title="Add custom color">
+            <input type="color" id="hct-add-color" value="#ffffff">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        </label>
+        <button class="hct-reset" id="hct-reset" title="Reset to default color">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
     </div>
 
     <script src="llm.js"></script>

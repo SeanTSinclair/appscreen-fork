@@ -65,6 +65,7 @@ const state = {
             headlineUnderline: false,
             headlineStrikethrough: false,
             headlineColor: '#ffffff',
+            headlineColorRuns: {},
             perLanguageLayout: false,
             languageSettings: {
                 en: {
@@ -184,6 +185,7 @@ function normalizeTextSettings(text) {
     }
 
     merged.headlines = merged.headlines || { en: '' };
+    merged.headlineColorRuns = merged.headlineColorRuns || {};
     merged.headlineLanguages = merged.headlineLanguages || ['en'];
     merged.currentHeadlineLang = merged.currentHeadlineLang || merged.headlineLanguages[0] || 'en';
     merged.currentLayoutLang = merged.currentLayoutLang || merged.currentHeadlineLang || 'en';
@@ -201,6 +203,215 @@ function normalizeTextSettings(text) {
 
     return merged;
 }
+
+// ── Headline color-run helpers ──────────────────────────────────────────────
+
+// Get plain text from a contenteditable div (preserves manual newlines)
+function getPlainTextFromDiv(div) {
+    let text = '';
+    div.childNodes.forEach(node => {
+        if (node.nodeType === Node.TEXT_NODE) {
+            text += node.textContent;
+        } else if (node.nodeName === 'BR') {
+            text += '\n';
+        } else if (node.nodeType === Node.ELEMENT_NODE) {
+            text += node.textContent;
+            if (node.nodeName === 'DIV') text += '\n';
+        }
+    });
+    return text;
+}
+
+// Serialize contenteditable to [{text, color}] runs
+function getColorRunsFromDiv(div, defaultColor) {
+    const runs = [];
+    function traverse(node) {
+        if (node.nodeType === Node.TEXT_NODE) {
+            if (node.textContent) {
+                const color = getNodeColor(node, defaultColor);
+                const last = runs[runs.length - 1];
+                if (last && last.color === color) {
+                    last.text += node.textContent;
+                } else {
+                    runs.push({ text: node.textContent, color });
+                }
+            }
+        } else if (node.nodeName === 'BR') {
+            const last = runs[runs.length - 1];
+            if (last) {
+                last.text += '\n';
+            } else {
+                runs.push({ text: '\n', color: defaultColor });
+            }
+        } else if (node.nodeType === Node.ELEMENT_NODE) {
+            node.childNodes.forEach(traverse);
+            if (node.nodeName === 'DIV') {
+                const last = runs[runs.length - 1];
+                if (last) {
+                    last.text += '\n';
+                } else {
+                    runs.push({ text: '\n', color: defaultColor });
+                }
+            }
+        }
+    }
+    div.childNodes.forEach(traverse);
+    const merged = [];
+    for (const run of runs) {
+        if (!run.text) continue;
+        const last = merged[merged.length - 1];
+        if (last && last.color === run.color) {
+            last.text += run.text;
+        } else {
+            merged.push({ ...run });
+        }
+    }
+    return merged;
+}
+
+// Get effective color of a text node by walking up to find a colored ancestor.
+// Stops at the headline div itself (id="headline-text").
+function getNodeColor(node, defaultColor) {
+    let el = node.parentElement;
+    while (el) {
+        if (el.id === 'headline-text') break;
+        if (el.style && el.style.color) return normalizeHexColor(el.style.color);
+        // foreColor execCommand produces <font color="..."> in some browsers
+        if (el.tagName === 'FONT' && el.color) return normalizeHexColor(el.color);
+        el = el.parentElement;
+    }
+    return null; // null = use headlineColor (default)
+}
+
+// Normalize rgb(r,g,b) or #hex to lowercase #hex
+function normalizeHexColor(color) {
+    if (!color) return null;
+    color = color.trim();
+    if (color.startsWith('#')) return color.toLowerCase();
+    const m = color.match(/^rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$/i);
+    if (m) {
+        return '#' + [m[1], m[2], m[3]].map(v => parseInt(v).toString(16).padStart(2, '0')).join('');
+    }
+    return color;
+}
+
+// Rebuild contenteditable content from [{text, color}] runs using safe DOM APIs
+function setColorRunsToDiv(div, runs, defaultColor) {
+    div.textContent = '';
+    if (!runs || runs.length === 0) return;
+    const allDefault = runs.every(r => !r.color || r.color === defaultColor);
+    for (const run of runs) {
+        const parts = run.text.split('\n');
+        const useSpan = !allDefault && run.color && run.color !== defaultColor;
+        parts.forEach((part, idx) => {
+            if (part) {
+                if (useSpan) {
+                    const span = document.createElement('span');
+                    span.style.color = run.color;
+                    span.textContent = part;
+                    div.appendChild(span);
+                } else {
+                    div.appendChild(document.createTextNode(part));
+                }
+            }
+            if (idx < parts.length - 1) div.appendChild(document.createElement('br'));
+        });
+    }
+}
+
+// Set plain text to contenteditable div using safe DOM APIs
+function setPlainTextToDiv(div, text) {
+    div.textContent = '';
+    const parts = (text || '').split('\n');
+    parts.forEach((part, idx) => {
+        if (part) div.appendChild(document.createTextNode(part));
+        if (idx < parts.length - 1) div.appendChild(document.createElement('br'));
+    });
+}
+
+// Build a per-character color array from runs.
+// Returns null if all runs use the default color (null sentinel) — triggers fast path in drawColoredLine.
+function buildCharColors(runs) {
+    if (!runs || runs.length === 0) return null;
+    let hasExplicitColor = false;
+    const arr = [];
+    for (const run of runs) {
+        if (run.color !== null) hasExplicitColor = true;
+        for (let i = 0; i < run.text.length; i++) arr.push(run.color);
+    }
+    return hasExplicitColor ? arr : null;
+}
+
+// Draw a centered line with per-character colors
+function drawColoredLine(ctx, line, charColors, lineStart, defaultColor, centerX, y) {
+    if (!charColors || charColors.length === 0) {
+        ctx.fillStyle = defaultColor;
+        ctx.fillText(line, centerX, y);
+        return;
+    }
+    const segments = [];
+    let i = 0;
+    while (i < line.length) {
+        const color = charColors[lineStart + i] || defaultColor;
+        let j = i;
+        while (j < line.length && (charColors[lineStart + j] || defaultColor) === color) j++;
+        segments.push({ text: line.slice(i, j), color });
+        i = j;
+    }
+    if (segments.length === 1) {
+        ctx.fillStyle = segments[0].color;
+        ctx.fillText(line, centerX, y);
+        return;
+    }
+    const totalWidth = ctx.measureText(line).width;
+    const prevAlign = ctx.textAlign;
+    ctx.textAlign = 'left';
+    let x = centerX - totalWidth / 2;
+    for (const seg of segments) {
+        ctx.fillStyle = seg.color;
+        ctx.fillText(seg.text, x, y);
+        x += ctx.measureText(seg.text).width;
+    }
+    ctx.textAlign = prevAlign;
+}
+
+// Wrap text returning both lines and their start offsets in the source string
+function wrapTextWithOffsets(ctx, text, maxWidth) {
+    const lines = [];
+    const offsets = [];
+    const rawLines = String(text).split(/\r?\n/);
+    let globalOffset = 0;
+    rawLines.forEach((rawLine, rawIdx) => {
+        if (rawIdx > 0) globalOffset += 1;
+        if (rawLine === '') {
+            lines.push('');
+            offsets.push(globalOffset);
+            return;
+        }
+        const words = rawLine.split(' ');
+        let currentLine = '';
+        let lineStartOffset = globalOffset;
+        words.forEach(word => {
+            const testLine = currentLine + (currentLine ? ' ' : '') + word;
+            if (ctx.measureText(testLine).width > maxWidth && currentLine) {
+                lines.push(currentLine);
+                offsets.push(lineStartOffset);
+                lineStartOffset += currentLine.length + 1;
+                currentLine = word;
+            } else {
+                currentLine = testLine;
+            }
+        });
+        if (currentLine) {
+            lines.push(currentLine);
+            offsets.push(lineStartOffset);
+        }
+        globalOffset += rawLine.length;
+    });
+    return { lines, offsets };
+}
+
+// ── End headline color-run helpers ──────────────────────────────────────────
 
 function getElements() {
     const screenshot = getCurrentScreenshot();
@@ -1902,6 +2113,7 @@ function resetStateToDefaults() {
             headlineUnderline: false,
             headlineStrikethrough: false,
             headlineColor: '#ffffff',
+            headlineColorRuns: {},
             perLanguageLayout: false,
             languageSettings: {
                 en: {
@@ -2230,7 +2442,13 @@ function syncUIWithState() {
     const subheadlineLayout = getEffectiveLayout(txt, subheadlineLang);
     const layoutSettings = getEffectiveLayout(txt, layoutLang);
     const currentHeadline = txt.headlines ? (txt.headlines[headlineLang] || '') : (txt.headline || '');
-    document.getElementById('headline-text').value = currentHeadline;
+    const headlineDiv = document.getElementById('headline-text');
+    const headlineRuns = txt.headlineColorRuns ? (txt.headlineColorRuns[headlineLang] || []) : [];
+    if (headlineRuns.length > 0) {
+        setColorRunsToDiv(headlineDiv, headlineRuns, txt.headlineColor);
+    } else {
+        setPlainTextToDiv(headlineDiv, currentHeadline);
+    }
     document.getElementById('headline-font').value = txt.headlineFont;
     updateFontPickerPreview();
     document.getElementById('headline-size').value = headlineLayout.headlineSize;
@@ -3783,6 +4001,65 @@ function setupEventListeners() {
         document.getElementById('delete-project-modal').classList.remove('visible');
     });
 
+    // Export project backup
+    document.getElementById('export-project-btn').addEventListener('click', async () => {
+        if (!db) return;
+        try {
+            const dump = {};
+            for (const name of db.objectStoreNames) {
+                const tx = db.transaction(name, 'readonly');
+                const store = tx.objectStore(name);
+                dump[name] = await new Promise((resolve) => {
+                    const req = store.getAll();
+                    req.onsuccess = () => resolve(req.result);
+                    req.onerror = () => resolve([]);
+                });
+            }
+            const json = JSON.stringify(dump, null, 2);
+            const blob = new Blob([json], { type: 'application/json' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'appscreen-backup-' + new Date().toISOString().slice(0, 10) + '.json';
+            a.click();
+            URL.revokeObjectURL(a.href);
+        } catch (e) {
+            console.error('Export failed:', e);
+            alert('Export failed: ' + e.message);
+        }
+    });
+
+    // Import project backup
+    const importInput = document.getElementById('import-project-input');
+    document.getElementById('import-project-btn').addEventListener('click', () => {
+        importInput.click();
+    });
+    importInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file || !db) return;
+        try {
+            const text = await file.text();
+            const dump = JSON.parse(text);
+            for (const storeName of Object.keys(dump)) {
+                if (!db.objectStoreNames.contains(storeName)) continue;
+                const tx = db.transaction(storeName, 'readwrite');
+                const store = tx.objectStore(storeName);
+                for (const record of dump[storeName]) {
+                    store.put(record);
+                }
+                await new Promise((resolve, reject) => {
+                    tx.oncomplete = resolve;
+                    tx.onerror = () => reject(tx.error);
+                });
+            }
+            alert('Import complete! Reloading...');
+            location.reload();
+        } catch (e) {
+            console.error('Import failed:', e);
+            alert('Import failed: ' + e.message);
+        }
+        importInput.value = '';
+    });
+
     // Apply style to all modal buttons
     document.getElementById('apply-style-cancel').addEventListener('click', () => {
         document.getElementById('apply-style-modal').classList.remove('visible');
@@ -4440,10 +4717,20 @@ function setupEventListeners() {
     });
 
     // Text settings
-    document.getElementById('headline-text').addEventListener('input', (e) => {
+    document.getElementById('headline-text').addEventListener('paste', (e) => {
+        e.preventDefault();
+        const plain = (e.clipboardData || window.clipboardData).getData('text/plain');
+        document.execCommand('insertText', false, plain);
+    });
+
+    document.getElementById('headline-text').addEventListener('input', () => {
+        const div = document.getElementById('headline-text');
         const text = getTextSettings();
+        const lang = text.currentHeadlineLang || 'en';
         if (!text.headlines) text.headlines = { en: '' };
-        text.headlines[text.currentHeadlineLang || 'en'] = e.target.value;
+        if (!text.headlineColorRuns) text.headlineColorRuns = {};
+        text.headlines[lang] = getPlainTextFromDiv(div);
+        text.headlineColorRuns[lang] = getColorRunsFromDiv(div, text.headlineColor);
         updateCanvas();
     });
 
@@ -4460,6 +4747,201 @@ function setupEventListeners() {
         setTextValue('headlineColor', e.target.value);
         updateCanvas();
     });
+
+    // ── Headline color toolbar ──────────────────────────────────────────────
+    (function initHeadlineColorToolbar() {
+        const toolbar = document.getElementById('headline-color-toolbar');
+        const headlineDiv = document.getElementById('headline-text');
+        const swatchesContainer = document.getElementById('hct-swatches');
+        const MAX_SWATCHES = 10;
+        const STORAGE_KEY = 'headlineColorSwatches';
+        const DEFAULT_SWATCHES = ['#ffffff', '#000000', '#ffd60a', '#ff453a', '#0a84ff', '#30d158'];
+
+        // Selection saved as stable char offsets so DOM rebuilds don't invalidate it
+        let savedCharRange = null; // { start, end }
+        let selectionRect = null;
+
+        // ── Swatch persistence ──
+        function loadSwatches() {
+            try {
+                const stored = localStorage.getItem(STORAGE_KEY);
+                if (stored) return JSON.parse(stored);
+            } catch (e) {}
+            return [...DEFAULT_SWATCHES];
+        }
+
+        function saveSwatches(swatches) {
+            try { localStorage.setItem(STORAGE_KEY, JSON.stringify(swatches)); } catch (e) {}
+        }
+
+        function addSwatch(color) {
+            const swatches = loadSwatches();
+            const normalized = color.toLowerCase();
+            const idx = swatches.indexOf(normalized);
+            if (idx !== -1) swatches.splice(idx, 1);
+            swatches.unshift(normalized);
+            if (swatches.length > MAX_SWATCHES) swatches.length = MAX_SWATCHES;
+            saveSwatches(swatches);
+            renderSwatches();
+        }
+
+        function renderSwatches() {
+            swatchesContainer.textContent = '';
+            const swatches = loadSwatches();
+            swatches.forEach(color => {
+                const btn = document.createElement('button');
+                btn.className = 'hct-swatch';
+                btn.style.background = color;
+                btn.title = color;
+                btn.addEventListener('mousedown', (e) => {
+                    e.preventDefault();
+                    applyColor(color);
+                });
+                swatchesContainer.appendChild(btn);
+            });
+        }
+
+        // Walk text nodes in the div, calling cb(node, charOffset) for each
+        function walkTextNodes(div, cb) {
+            let pos = 0;
+            function walk(node) {
+                if (node.nodeType === Node.TEXT_NODE) {
+                    cb(node, pos);
+                    pos += node.textContent.length;
+                } else if (node.nodeName === 'BR') {
+                    pos += 1;
+                } else if (node.nodeType === Node.ELEMENT_NODE) {
+                    node.childNodes.forEach(walk);
+                    if (node.nodeName === 'DIV') pos += 1;
+                }
+            }
+            div.childNodes.forEach(walk);
+        }
+
+        function getSelectionCharRange() {
+            const sel = window.getSelection();
+            if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+            const range = sel.getRangeAt(0);
+            if (!headlineDiv.contains(range.commonAncestorContainer)) return null;
+            let start = -1, end = -1;
+            walkTextNodes(headlineDiv, (node, pos) => {
+                if (range.startContainer === node) start = pos + range.startOffset;
+                if (range.endContainer === node) end = pos + range.endOffset;
+            });
+            return start >= 0 && end > start ? { start, end } : null;
+        }
+
+        function restoreSelectionFromCharRange(charStart, charEnd) {
+            let startNode = null, startOff = 0, endNode = null, endOff = 0;
+            walkTextNodes(headlineDiv, (node, pos) => {
+                const len = node.textContent.length;
+                if (startNode === null && charStart >= pos && charStart <= pos + len) {
+                    startNode = node; startOff = charStart - pos;
+                }
+                if (endNode === null && charEnd >= pos && charEnd <= pos + len) {
+                    endNode = node; endOff = charEnd - pos;
+                }
+            });
+            if (!startNode || !endNode) return;
+            const sel = window.getSelection();
+            const range = document.createRange();
+            range.setStart(startNode, startOff);
+            range.setEnd(endNode, endOff);
+            sel.removeAllRanges();
+            sel.addRange(range);
+        }
+
+        // Apply color to [start, end) of the current runs, rebuild div, restore selection
+        function applyColor(color, addToSwatches = true) {
+            if (!savedCharRange) return;
+            const { start, end } = savedCharRange;
+            const text = getTextSettings();
+            const lang = text.currentHeadlineLang || 'en';
+            if (!text.headlineColorRuns) text.headlineColorRuns = {};
+
+            // Build current runs (seed from plain text if none yet).
+            // null color = "use default headlineColor" sentinel.
+            let runs = text.headlineColorRuns[lang] || [];
+            if (runs.length === 0) {
+                const plain = text.headlines ? (text.headlines[lang] || '') : '';
+                if (plain) runs = [{ text: plain, color: null }];
+            }
+
+            // Rebuild per-char colors, apply new color in range, re-merge into runs
+            const chars = [];
+            for (const run of runs) {
+                for (let i = 0; i < run.text.length; i++) {
+                    chars.push({ ch: run.text[i], color: run.color });
+                }
+            }
+            for (let i = start; i < end && i < chars.length; i++) {
+                chars[i].color = color;
+            }
+            const newRuns = [];
+            for (const { ch, color: c } of chars) {
+                const last = newRuns[newRuns.length - 1];
+                if (last && last.color === c) { last.text += ch; }
+                else { newRuns.push({ text: ch, color: c }); }
+            }
+
+            text.headlineColorRuns[lang] = newRuns;
+            setColorRunsToDiv(headlineDiv, newRuns, text.headlineColor);
+            restoreSelectionFromCharRange(start, end);
+            updateCanvas();
+
+            if (addToSwatches && color !== null) addSwatch(color);
+        }
+
+        function showToolbar() {
+            const charRange = getSelectionCharRange();
+            if (!charRange) { hideToolbar(); return; }
+            savedCharRange = charRange;
+            const sel = window.getSelection();
+            const rect = sel.getRangeAt(0).getBoundingClientRect();
+            selectionRect = rect;
+            renderSwatches();
+            toolbar.style.display = 'flex';
+            const tw = toolbar.offsetWidth;
+            let left = rect.left + rect.width / 2 - tw / 2;
+            left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+            const top = rect.top - toolbar.offsetHeight - 8;
+            toolbar.style.left = left + 'px';
+            toolbar.style.top = (top < 8 ? rect.bottom + 8 : top) + 'px';
+        }
+
+        function hideToolbar() {
+            toolbar.style.display = 'none';
+            savedCharRange = null;
+        }
+
+        headlineDiv.addEventListener('mouseup', () => setTimeout(showToolbar, 10));
+        headlineDiv.addEventListener('keyup', () => setTimeout(showToolbar, 10));
+
+        document.addEventListener('mousedown', (e) => {
+            if (!toolbar.contains(e.target) && !headlineDiv.contains(e.target)) {
+                setTimeout(() => {
+                    const sel = window.getSelection();
+                    if (!sel || sel.isCollapsed) hideToolbar();
+                }, 150);
+            }
+        });
+
+        // + button: pick a color, add it to swatches and apply
+        const addColorInput = document.getElementById('hct-add-color');
+        addColorInput.parentElement.addEventListener('mousedown', (e) => e.preventDefault());
+        addColorInput.addEventListener('change', (e) => {
+            applyColor(e.target.value, true);
+        });
+
+        document.getElementById('hct-reset').addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            applyColor(null, false); // null = reset to default headlineColor
+        });
+
+        // Render initial swatches
+        renderSwatches();
+    })();
+    // ── End headline color toolbar ──────────────────────────────────────────
 
     document.getElementById('headline-weight').addEventListener('change', (e) => {
         setTextValue('headlineWeight', e.target.value);
@@ -5047,7 +5529,10 @@ function applyTranslations() {
 
         const currentLang = isHeadline ? text.currentHeadlineLang : text.currentSubheadlineLang;
         if (isHeadline) {
-            document.getElementById('headline-text').value = texts[currentLang] || '';
+            // Translation produces plain text — clear any color runs for this lang
+            const _txt = getTextSettings();
+            if (_txt.headlineColorRuns) delete _txt.headlineColorRuns[currentLang];
+            setPlainTextToDiv(document.getElementById('headline-text'), texts[currentLang] || '');
         } else {
             document.getElementById('subheadline-text').value = texts[currentLang] || '';
             text.subheadlineEnabled = true;
@@ -5878,7 +6363,13 @@ function updateTextUI(text) {
     const headlineText = text.headlines ? (text.headlines[headlineLang] || '') : (text.headline || '');
     const subheadlineText = text.subheadlines ? (text.subheadlines[subheadlineLang] || '') : (text.subheadline || '');
 
-    document.getElementById('headline-text').value = headlineText;
+    const _headlineDiv = document.getElementById('headline-text');
+    const _headlineRuns = text.headlineColorRuns ? (text.headlineColorRuns[headlineLang] || []) : [];
+    if (_headlineRuns.length > 0) {
+        setColorRunsToDiv(_headlineDiv, _headlineRuns, text.headlineColor);
+    } else {
+        setPlainTextToDiv(_headlineDiv, headlineText);
+    }
     document.getElementById('headline-font').value = text.headlineFont;
     updateFontPickerPreview();
     document.getElementById('headline-size').value = headlineLayout.headlineSize;
@@ -7257,10 +7748,11 @@ function drawTextToContext(context, dims, txt) {
         context.font = `${fontStyle} ${txt.headlineWeight} ${headlineLayout.headlineSize}px ${txt.headlineFont}`;
         context.fillStyle = txt.headlineColor;
 
-        const lines = wrapText(context, headline, dims.width - padding * 2);
+        const colorRuns = txt.headlineColorRuns ? (txt.headlineColorRuns[headlineLang] || []) : [];
+        const charColors = buildCharColors(colorRuns);
+        const { lines, offsets } = wrapTextWithOffsets(context, headline, dims.width - padding * 2);
         const lineHeight = headlineLayout.headlineSize * (layoutSettings.lineHeight / 100);
 
-        // For bottom positioning, offset currentY so lines draw correctly
         if (layoutSettings.position === 'bottom') {
             currentY -= (lines.length - 1) * lineHeight;
         }
@@ -7269,9 +7761,8 @@ function drawTextToContext(context, dims, txt) {
         lines.forEach((line, i) => {
             const y = currentY + i * lineHeight;
             lastLineY = y;
-            context.fillText(line, dims.width / 2, y);
+            drawColoredLine(context, line, charColors, offsets[i], txt.headlineColor, dims.width / 2, y);
 
-            // Calculate text metrics for decorations
             const textWidth = context.measureText(line).width;
             const fontSize = headlineLayout.headlineSize;
             const lineThickness = Math.max(2, fontSize * 0.05);
@@ -7279,6 +7770,7 @@ function drawTextToContext(context, dims, txt) {
 
             // Draw underline
             if (txt.headlineUnderline) {
+                context.fillStyle = txt.headlineColor;
                 const underlineY = layoutSettings.position === 'top'
                     ? y + fontSize * 0.9
                     : y + fontSize * 0.1;
@@ -7287,6 +7779,7 @@ function drawTextToContext(context, dims, txt) {
 
             // Draw strikethrough
             if (txt.headlineStrikethrough) {
+                context.fillStyle = txt.headlineColor;
                 const strikeY = layoutSettings.position === 'top'
                     ? y + fontSize * 0.4
                     : y - fontSize * 0.4;
@@ -7852,7 +8345,9 @@ function drawText() {
         ctx.font = `${fontStyle} ${text.headlineWeight} ${headlineLayout.headlineSize}px ${text.headlineFont}`;
         ctx.fillStyle = text.headlineColor;
 
-        const lines = wrapText(ctx, headline, dims.width - padding * 2);
+        const colorRuns = text.headlineColorRuns ? (text.headlineColorRuns[headlineLang] || []) : [];
+        const charColors = buildCharColors(colorRuns);
+        const { lines, offsets } = wrapTextWithOffsets(ctx, headline, dims.width - padding * 2);
         const lineHeight = headlineLayout.headlineSize * (layoutSettings.lineHeight / 100);
 
         if (layoutSettings.position === 'bottom') {
@@ -7863,10 +8358,8 @@ function drawText() {
         lines.forEach((line, i) => {
             const y = currentY + i * lineHeight;
             lastLineY = y;
-            ctx.fillText(line, dims.width / 2, y);
+            drawColoredLine(ctx, line, charColors, offsets[i], text.headlineColor, dims.width / 2, y);
 
-            // Calculate text metrics for decorations
-            // When textBaseline is 'top', y is at top of text; when 'bottom', y is at bottom
             const textWidth = ctx.measureText(line).width;
             const fontSize = headlineLayout.headlineSize;
             const lineThickness = Math.max(2, fontSize * 0.05);
@@ -7874,30 +8367,27 @@ function drawText() {
 
             // Draw underline
             if (text.headlineUnderline) {
+                ctx.fillStyle = text.headlineColor;
                 const underlineY = layoutSettings.position === 'top'
-                    ? y + fontSize * 0.9  // Below text when baseline is top
-                    : y + fontSize * 0.1; // Below text when baseline is bottom
+                    ? y + fontSize * 0.9
+                    : y + fontSize * 0.1;
                 ctx.fillRect(x, underlineY, textWidth, lineThickness);
             }
 
             // Draw strikethrough
             if (text.headlineStrikethrough) {
+                ctx.fillStyle = text.headlineColor;
                 const strikeY = layoutSettings.position === 'top'
-                    ? y + fontSize * 0.4  // Middle of text when baseline is top
-                    : y - fontSize * 0.4; // Middle of text when baseline is bottom
+                    ? y + fontSize * 0.4
+                    : y - fontSize * 0.4;
                 ctx.fillRect(x, strikeY, textWidth, lineThickness);
             }
         });
 
-        // Track where subheadline should start (below the bottom edge of headline)
-        // The gap between headline and subheadline should be (lineHeight - fontSize)
-        // This is the "extra" spacing beyond the text itself
         const gap = lineHeight - headlineLayout.headlineSize;
         if (layoutSettings.position === 'top') {
-            // For top: lastLineY is top of last line, add fontSize to get bottom, then add gap
             currentY = lastLineY + headlineLayout.headlineSize + gap;
         } else {
-            // For bottom: lastLineY is already the bottom of last line, just add gap
             currentY = lastLineY + gap;
         }
     }
